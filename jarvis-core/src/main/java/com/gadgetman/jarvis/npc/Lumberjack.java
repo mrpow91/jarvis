@@ -150,15 +150,16 @@ class Lumberjack {
 
         double dist = loc.distance(currentBase.center());
         if (dist > 2.8) {
+            Vec3 approach = findTreeApproach(loc);
             if (!butler.isNavigating()) {
-                butler.navigateTo(currentBase.above().standing());
+                butler.navigateTo(approach);
             }
             if (lastPos != null && loc.distance(lastPos) < 0.15) stalled++;
             else stalled = 0;
             lastPos = loc;
             if (stalled > STALL_HOP_TICKS) {
                 butler.cancelNavigation();
-                butler.teleport(host.findSafeNear(world, currentBase.above().standing()));
+                butler.teleport(host.findSafeNear(world, approach));
                 stalled = 0;
             }
             return;
@@ -221,7 +222,37 @@ class Lumberjack {
             }
         });
     }
+/** Pick a clear standing position beside the trunk, within chopping range. */
+    private Vec3 findTreeApproach(Vec3 from) {
+        Vec3 best = null;
+        double bestDistance = Double.MAX_VALUE;
 
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                for (int dy = -1; dy <= 1; dy++) {
+                    BlockPos feet = currentBase.offset(dx, dy, dz);
+                    if (!world.isPassable(feet)
+                            || !world.isPassable(feet.above())
+                            || world.isLiquid(feet)
+                            || world.isLiquid(feet.above())
+                            || !world.isSolid(feet.below())) {
+                        continue;
+                    }
+
+                    Vec3 candidate = feet.standing();
+                    double distance = from.distance(candidate);
+                    if (distance < bestDistance) {
+                        best = candidate;
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+
+        // Preserve the existing fallback if no clear position is available.
+        return best != null ? best : currentBase.above().standing();
+    }
     private void replantSapling(BlockPos base, String species) {
         String sapling = SAPLINGS.get(species);
         if (sapling == null) return;
