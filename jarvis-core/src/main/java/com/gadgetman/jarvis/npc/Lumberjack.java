@@ -62,7 +62,10 @@ class Lumberjack {
     private boolean busy = false;
     private BlockPos currentBase = null;
     private int stalled = 0;
-    private Vec3 lastPos = null;
+    private Vec3 treeApproach = null;
+    private double bestApproachDistance = Double.MAX_VALUE;
+    private final Set<Long> rejectedApproaches = new HashSet<>();
+    private final Set<Long> skippedTrees = new HashSet<>();
     private Task mainTask = null;   // v0.8.0: lets callbacks notice /jarvis stop
     /** Set when self-explain decides to keep felling with nowhere to put the timber. */
     private boolean depositsPaused = false;
@@ -70,6 +73,9 @@ class Lumberjack {
     private static final int SEARCH_RADIUS = 24;
     private static final int MAX_TREE_LOGS = 80;
     private static final int STALL_HOP_TICKS = 8;
+    private static final double CHOP_REACH = 2.8;
+    // Leave room for the navigator's arrival tolerance.
+    private static final double APPROACH_REACH = 2.4;
 
     Lumberjack(ButlerHost host, Owner player, DepositManager deposits, int treeQuota) {
         this.host = host;
@@ -141,6 +147,11 @@ class Lumberjack {
 
         // Find (or continue toward) the next tree base
         if (currentBase == null || !LOGS.contains(world.block(currentBase).id())) {
+            butler.cancelNavigation();
+            treeApproach = null;
+            rejectedApproaches.clear();
+            stalled = 0;
+            bestApproachDistance = Double.MAX_VALUE;
             currentBase = findNearestTreeBase(loc.block());
             if (currentBase == null) {
                 finish(self);
@@ -149,18 +160,45 @@ class Lumberjack {
         }
 
         double dist = loc.distance(currentBase.center());
-        if (dist > 2.8) {
-            Vec3 approach = findTreeApproach(loc);
-            if (!butler.isNavigating()) {
-                butler.navigateTo(approach);
+        if (dist > CHOP_REACH) {
+            if (treeApproach == null || !isTreeApproach(treeApproach.block())) {
+                butler.cancelNavigation();
+                treeApproach = findTreeApproach(loc);
+                stalled = 0;
+                bestApproachDistance = Double.MAX_VALUE;
+                if (treeApproach == null) {
+                    skippedTrees.add(currentBase.packed());
+                    currentBase = null;
+                    host.sayQuiet(player, "No clear place to stand by that trunk. Choosing another.");
+                    return;
+                }
             }
-            if (lastPos != null && loc.distance(lastPos) < 0.15) stalled++;
-            else stalled = 0;
-            lastPos = loc;
+
+            double approachDistance = loc.distance(treeApproach);
+            if (approachDistance < bestApproachDistance - 0.15) {
+                bestApproachDistance = approachDistance;
+                stalled = 0;
+            } else {
+                stalled++;
+            }
+
             if (stalled > STALL_HOP_TICKS) {
                 butler.cancelNavigation();
-                butler.teleport(host.findSafeNear(world, approach));
+                if (rejectedApproaches.isEmpty()) {
+                    // Try another side before using the existing last-resort hop.
+                    Vec3 previous = treeApproach;
+                    rejectedApproaches.add(previous.block().packed());
+                    treeApproach = findTreeApproach(loc);
+                    if (treeApproach == null) treeApproach = previous;
+                } else {
+                    // Already validated above: do not offset him out of chopping range.
+                    butler.teleport(treeApproach);
+                }
                 stalled = 0;
+                bestApproachDistance = Double.MAX_VALUE;
+            }
+            if (!butler.isNavigating()) {
+                butler.navigateTo(treeApproach);
             }
             return;
         }
@@ -222,23 +260,17 @@ class Lumberjack {
             }
         });
     }
-/** Pick a clear standing position beside the trunk, within chopping range. */
+    /** Pick a clear standing position within reach, avoiding a failed approach. */
     private Vec3 findTreeApproach(Vec3 from) {
         Vec3 best = null;
         double bestDistance = Double.MAX_VALUE;
 
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
                 if (dx == 0 && dz == 0) continue;
                 for (int dy = -1; dy <= 1; dy++) {
                     BlockPos feet = currentBase.offset(dx, dy, dz);
-                    if (!world.isPassable(feet)
-                            || !world.isPassable(feet.above())
-                            || world.isLiquid(feet)
-                            || world.isLiquid(feet.above())
-                            || !world.isSolid(feet.below())) {
-                        continue;
-                    }
+                    if (rejectedApproaches.contains(feet.packed()) || !isTreeApproach(feet)) continue;
 
                     Vec3 candidate = feet.standing();
                     double distance = from.distance(candidate);
@@ -249,10 +281,22 @@ class Lumberjack {
                 }
             }
         }
-
-        // Preserve the existing fallback if no clear position is available.
-        return best != null ? best : currentBase.above().standing();
+        return best;
     }
+
+    private boolean isTreeApproach(BlockPos feet) {
+        if (feet.y() <= world.minY() || feet.y() + 1 > world.maxY()) return false;
+        return feet.standing().distance(currentBase.center()) <= APPROACH_REACH
+                && world.isPassable(feet)
+                && world.isPassable(feet.above())
+                && !world.isLiquid(feet)
+                && !world.isLiquid(feet.above())
+                && world.isSolid(feet.below())
+                && !Blocks.HAZARDOUS_FOOTING.contains(world.block(feet.below()).id())
+                && !Blocks.HAZARDOUS_FOOTING.contains(world.block(feet).id())
+                && !Blocks.HAZARDOUS_FOOTING.contains(world.block(feet.above()).id());
+    }
+
     private void replantSapling(BlockPos base, String species) {
         String sapling = SAPLINGS.get(species);
         if (sapling == null) return;
@@ -270,6 +314,7 @@ class Lumberjack {
             for (int y = -6; y <= 6; y++) {
                 for (int z = -SEARCH_RADIUS; z <= SEARCH_RADIUS; z++) {
                     BlockPos b = center.offset(x, y, z);
+                    if (skippedTrees.contains(b.packed())) continue;
                     if (!LOGS.contains(world.block(b).id())) continue;
                     if (!SOIL.contains(world.block(b.below()).id())) continue;
                     if (!hasLeavesAbove(b)) continue;
