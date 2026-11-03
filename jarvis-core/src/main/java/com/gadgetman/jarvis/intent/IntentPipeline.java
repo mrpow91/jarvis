@@ -243,7 +243,15 @@ public class IntentPipeline {
             case "guard", "defend", "protect"-> npc.guard(player, "defensive");
             case "watch", "sentry"         -> npc.watch(player, null);
             case "stand_down"              -> npc.guard(player, "passive");
-            case "mine", "mining"          -> npc.mine(player);
+            case "mine", "mining" -> {
+                    String ore = parameters == null
+                    ? "" : parameters.optString("ore", "").trim();
+                    if (ore.isEmpty()) {
+                      npc.mine(player);
+                    } else {
+                npc.mine(player, new String[]{ore});
+                        }
+                    }
             case "stop"                    -> npc.stop(player);
             case "loot", "inventory"       -> npc.openInventory(player);
             case "build" -> {
